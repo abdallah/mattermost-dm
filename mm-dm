@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""Send Mattermost direct messages as the token's owner.
+
+usage: mm-dm [--dry-run] --message-file FILE --to RECIPIENT [--to RECIPIENT ...]
+       mm-dm [--dry-run] --message-file FILE --to-file FILE   (one recipient per line, # comments)
+
+RECIPIENT is an email (looked up by email) or a Mattermost username.
+The message may use {first_name}, {last_name} and {username} of each recipient, and {hi}: a greeting
+when you have not spoken today or for over 4 hours, else empty. FILE "-" reads the message from stdin.
+--dry-run saves what it printed; mm-dm --send-pending sends exactly that (within an hour, once).
+
+Server and token come from the environment only (never printed). Accepted names:
+  server: MM_URL MATTERMOST_URL MM_SERVER MATTERMOST_SERVER MM_SERVICESETTINGS_SITEURL MATTERMOST_HOST
+  token:  MM_TOKEN MATTERMOST_TOKEN MM_ACCESS_TOKEN MATTERMOST_ACCESS_TOKEN MM_PAT MATTERMOST_PAT
+If none are set, they are read from ~/.mattermost (KEY=VALUE lines, optional `export`, quotes).
+MM_DM_GREETINGS_AM and MM_DM_GREETINGS_PM optionally replace the {hi} greetings ("|"-separated).
+Typical run: mm-dm --dry-run --message-file m.txt --to a@x.com
+
+--dry-run resolves every recipient and prints each rendered message; nothing is sent.
+Without it, every recipient is resolved first; if any lookup fails, nothing is sent at all.
+
+mm-dm --channel TEAM/CHANNEL --message-file FILE [--dry-run]
+  posts once to a channel (TEAM and CHANNEL are the names in the channel URL); prints the post id.
+
+mm-dm --edit POST_ID --message-file FILE [--attach FILE] [--dry-run]
+  replaces that post's text; --attach uploads a file and sets it as the post's only attachment.
+
+mm-dm --last-spoke --to RECIPIENT [--to ...]
+  prints, per recipient, "greet" (not spoken today, or over 4h ago) or "no greeting"; sends nothing.
+  --dry-run prints the same status in each message header.
+
+mm-dm --wait-reply POST_ID [--interval 60] [--timeout-hours 24]
+  blocks until someone other than you posts in that post's channel after it (a DM reply or a
+  thread reply), prints the replies, exits 0. Exit 3 on timeout. Run it as a background command.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+URL_NAMES = ["MM_URL", "MATTERMOST_URL", "MM_SERVER", "MATTERMOST_SERVER", "MM_SERVICESETTINGS_SITEURL", "MATTERMOST_HOST"]
+TOKEN_NAMES = ["MM_TOKEN", "MATTERMOST_TOKEN", "MM_ACCESS_TOKEN", "MATTERMOST_ACCESS_TOKEN", "MM_PAT", "MATTERMOST_PAT"]
+
+
+ENV_FILE = os.path.expanduser("~/.mattermost")
+# Everyone DMed once, keyed by every name they were reached by; no secrets.
+CONTACTS_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "contacts.json")
+USER_KEYS = ("id", "username", "email", "first_name", "last_name", "nickname")
+
+
+def load_contacts():
+    try:
+        with open(CONTACTS_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def lookup(api, who, contacts):
+    """A cached contact by any alias, else the server by email or username."""
+    u = contacts.get(who.strip().lower())
+    if u:
+        return u
+    return api.call("GET", "/users/email/" + who if "@" in who else "/users/username/" + who)
+
+
+def remember(contacts, who, u):
+    """Save u under the name it was asked by, its username, email, the email's local part and nickname."""
+    entry = {k: u.get(k, "") for k in USER_KEYS}
+    email = entry["email"] or ""
+    full = ("%s %s" % (entry["first_name"], entry["last_name"])).strip()
+    for alias in (who, entry["username"], email, email.split("@")[0], entry["nickname"], full):
+        if alias:
+            contacts[alias.strip().lower()] = entry
+    tmp = CONTACTS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(contacts, f, indent=1, sort_keys=True)
+    os.replace(tmp, CONTACTS_FILE)
+
+
+def load_env_file(path=ENV_FILE):
+    # Fill only unset variables, so an explicit environment still wins.
+    if not os.path.isfile(path):
+        return
+    for line in open(path):
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.removeprefix("export ").split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+
+
+def first_env(names):
+    load_env_file()
+    for n in names:
+        if os.environ.get(n):
+            return os.environ[n]
+    sys.exit("mm-dm: none of these are set: " + ", ".join(names) + " (set them, or put them in ~/.mattermost)")
+
+
+class Api:
+    def __init__(self):
+        url = first_env(URL_NAMES).rstrip("/")
+        self.base = (url if url.startswith("http") else "https://" + url) + "/api/v4"
+        self.token = first_env(TOKEN_NAMES)
+
+    def upload(self, channel_id, path):
+        boundary = "mmdm%d" % int(time.time() * 1000)
+        name = os.path.basename(path)
+        body = (("--%s\r\nContent-Disposition: form-data; name=\"channel_id\"\r\n\r\n%s\r\n"
+                 "--%s\r\nContent-Disposition: form-data; name=\"files\"; filename=\"%s\"\r\n"
+                 "Content-Type: text/markdown\r\n\r\n") % (boundary, channel_id, boundary, name)).encode() \
+            + open(path, "rb").read() + ("\r\n--%s--\r\n" % boundary).encode()
+        req = urllib.request.Request(self.base + "/files", method="POST", data=body, headers={
+            "Authorization": "Bearer " + self.token, "Content-Type": "multipart/form-data; boundary=" + boundary})
+        try:
+            return json.load(urllib.request.urlopen(req, timeout=60))["file_infos"][0]["id"]
+        except urllib.error.HTTPError as e:
+            raise RuntimeError("POST /files: HTTP %s %s" % (e.code, e.read()[:160].decode(errors="replace")))
+
+    def call(self, method, path, body=None):
+        req = urllib.request.Request(
+            self.base + path,
+            method=method,
+            data=None if body is None else json.dumps(body).encode(),
+            headers={"Authorization": "Bearer " + self.token, "Content-Type": "application/json"},
+        )
+        try:
+            return json.load(urllib.request.urlopen(req, timeout=20))
+        except urllib.error.HTTPError as e:
+            raise RuntimeError("%s %s: HTTP %s %s" % (method, path, e.code, e.read()[:160].decode(errors="replace")))
+
+
+def recipients(args):
+    out = list(args.to or [])
+    if args.to_file:
+        for line in open(args.to_file):
+            line = line.split("#", 1)[0].strip()
+            if line:
+                out.append(line)
+    if not out:
+        sys.exit("mm-dm: no recipients (--to or --to-file)")
+    return out
+
+
+def wait_reply(api, post_id, interval, timeout_hours):
+    me = api.call("GET", "/users/me")["id"]
+    try:
+        anchor = api.call("GET", "/posts/" + post_id)
+    except RuntimeError as e:
+        sys.exit("mm-dm: cannot read post %s (deleted, or not visible to you): %s" % (post_id, e))
+    deadline = time.time() + timeout_hours * 3600
+    print("waiting for a reply after post %s (every %ds, up to %gh)" % (post_id, interval, timeout_hours), flush=True)
+    while time.time() < deadline:
+        try:
+            page = api.call("GET", "/channels/%s/posts?since=%d" % (anchor["channel_id"], anchor["create_at"]))
+        except (RuntimeError, OSError) as e:  # transient: keep polling
+            print("poll failed, retrying: %s" % e, file=sys.stderr, flush=True)
+        else:
+            replies = sorted(
+                (p for p in page.get("posts", {}).values()
+                 if p["user_id"] != me and p["create_at"] > anchor["create_at"] and not p.get("type")),
+                key=lambda p: p["create_at"])
+            if replies:
+                names = {}
+                for p in replies:
+                    uid = p["user_id"]
+                    names.setdefault(uid, api.call("GET", "/users/" + uid)["username"])
+                    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(p["create_at"] / 1000))
+                    print("--- %s at %s ---\n%s" % (names[uid], stamp, p["message"]))
+                return 0
+        time.sleep(interval)
+    print("mm-dm: no reply within %gh" % timeout_hours)
+    return 3
+
+
+def history(api, who, days, grep):
+    """Read-only: print the DM with one person from the last `days` days, oldest first."""
+    me = api.call("GET", "/users/me")
+    u = lookup(api, who, load_contacts())
+    ch = api.call("POST", "/channels/direct", [me["id"], u["id"]])  # returns the existing DM channel
+    since = int((time.time() - days * 86400) * 1000)
+    page = api.call("GET", "/channels/%s/posts?since=%d" % (ch["id"], since))
+    names = {me["id"]: me["username"], u["id"]: u["username"]}
+    posts = sorted((p for p in page.get("posts", {}).values() if not p.get("type")),
+                   key=lambda p: p["create_at"])
+    shown = 0
+    for p in posts:
+        if grep and grep.lower() not in p["message"].lower():
+            continue
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(p["create_at"] / 1000))
+        print("--- %s at %s ---\n%s" % (names.get(p["user_id"], p["user_id"]), stamp, p["message"]))
+        shown += 1
+    print("--- %d of %d message(s) in the last %g day(s) with %s ---" % (shown, len(posts), days, u["username"]))
+    return 0
+
+
+GREET_GAP_H = 4
+PENDING = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "mm-dm", "pending.json")
+PENDING_MAX_AGE_S = 3600
+# Defaults; MM_DM_GREETINGS_AM and MM_DM_GREETINGS_PM replace them, as "|"-separated lists.
+GREETINGS_AM = ["good morning", "morning", "hi"]
+GREETINGS_PM = ["hi", "hello", "hey", "good afternoon"]
+
+
+def read_message(path):
+    if path == "-":
+        return sys.stdin.read().strip()
+    with open(path) as f:
+        return f.read().strip()
+
+
+def greeting(u, status):
+    if not status.startswith("greet"):
+        return ""
+    am = time.localtime().tm_hour < 12
+    custom = os.environ.get("MM_DM_GREETINGS_AM" if am else "MM_DM_GREETINGS_PM", "")
+    opts = [g.strip() for g in custom.split("|") if g.strip()] or (GREETINGS_AM if am else GREETINGS_PM)
+    # The pick is stable per person and day.
+    return opts[sum(map(ord, u["username"] + time.strftime("%Y%m%d"))) % len(opts)]
+
+
+def render(template, u, status):
+    hi = greeting(u, status)
+    msg = template.format(hi=hi, first_name=u.get("first_name") or u["username"],
+                          last_name=u.get("last_name", ""), username=u["username"])
+    return msg.lstrip() if not hi else msg  # drop the blank line left by an empty {hi}
+
+
+def greet_status(api, me_id, u):
+    """'greet' when we have not spoken today or for over GREET_GAP_H hours, else 'no greeting'."""
+    ch = api.call("POST", "/channels/direct", [me_id, u["id"]])  # returns the existing DM channel
+    last = max((p["create_at"] for p in api.call("GET", "/channels/%s/posts?per_page=20" % ch["id"]).get("posts", {}).values()
+                if not p.get("type")), default=0) / 1000
+    if not last:
+        return "greet       (never spoken)"
+    gap = (time.time() - last) / 3600
+    when = time.strftime("%m-%d %H:%M", time.localtime(last))
+    if time.strftime("%Y%m%d", time.localtime(last)) != time.strftime("%Y%m%d") or gap > GREET_GAP_H:
+        return "greet       (last spoke %s, %.1fh ago)" % (when, gap)
+    return "no greeting (last spoke %s, %.1fh ago)" % (when, gap)
+
+
+def send_pending(api):
+    try:
+        with open(PENDING) as f:
+            pending = json.load(f)
+    except (OSError, ValueError):
+        sys.exit("mm-dm: nothing pending; run --dry-run first")
+    if time.time() - pending["created"] > PENDING_MAX_AGE_S:
+        sys.exit("mm-dm: the pending preview is over an hour old; run --dry-run again")
+    os.remove(PENDING)  # one send per preview, even if a post below fails
+    me = api.call("GET", "/users/me"); contacts = load_contacts(); sent = 0
+    print("from: %s" % me["username"])
+    for it in pending["items"]:
+        u = it["user"]
+        try:
+            ch = api.call("POST", "/channels/direct", [me["id"], u["id"]])
+            post = api.call("POST", "/posts", {"channel_id": ch["id"], "message": it["message"]})
+            print("  sent %-20s post %s" % (u["username"], post["id"]))
+            sent += 1
+            remember(contacts, it["alias"], u)
+        except RuntimeError as e:
+            print("  FAIL %-20s %s" % (u["username"], e))
+    print("--- sent %d of %d ---" % (sent, len(pending["items"])))
+    return 0 if sent == len(pending["items"]) else 1
+
+
+def post_channel(api, target, msg, dry_run):
+    team, _, name = target.partition("/")
+    if not name:
+        sys.exit("mm-dm: --channel takes TEAM/CHANNEL, as in the channel URL")
+    try:
+        ch = api.call("GET", "/teams/name/%s/channels/name/%s" % (team, name))
+    except RuntimeError as e:
+        sys.exit("mm-dm: channel %s not found or not visible: %s" % (target, e))
+    print("from: %s\n  ok   channel %s (%s)" % (api.call("GET", "/users/me")["username"], target, ch.get("display_name", "")))
+    if dry_run:
+        print("\n--- to %s ---\n%s\n\n--- dry run: nothing sent ---" % (target, msg))
+        return 0
+    post = api.call("POST", "/posts", {"channel_id": ch["id"], "message": msg})
+    print("  sent %-20s post %s" % (target, post["id"]))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Send Mattermost DMs as the token's owner, or wait for a reply.")
+    ap.add_argument("--to", action="append", help="email or username; repeatable")
+    ap.add_argument("--to-file")
+    ap.add_argument("--message-file")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--channel", metavar="TEAM/CHANNEL", help="post to this channel instead of DMs")
+    ap.add_argument("--edit", metavar="POST_ID", help="replace that post's text with --message-file")
+    ap.add_argument("--attach", metavar="FILE", help="with --edit: attach this file to the post")
+    ap.add_argument("--wait-reply", metavar="POST_ID", help="block until someone replies after this post")
+    ap.add_argument("--interval", type=int, default=60, help="seconds between polls (--wait-reply)")
+    ap.add_argument("--timeout-hours", type=float, default=24, help="give up after this long (--wait-reply)")
+    ap.add_argument("--history", metavar="USER", help="read-only: print the DM with this email or username")
+    ap.add_argument("--days", type=float, default=14, help="how far back --history reads")
+    ap.add_argument("--grep", help="with --history: only messages containing this text")
+    ap.add_argument("--send-pending", action="store_true", help="send exactly what the last --dry-run printed")
+    ap.add_argument("--last-spoke", action="store_true", help="with --to/--to-file: print whether each needs a greeting; sends nothing")
+    args = ap.parse_args()
+    if args.history:
+        return history(Api(), args.history, args.days, args.grep)
+    if args.wait_reply:
+        return wait_reply(Api(), args.wait_reply, args.interval, args.timeout_hours)
+    if args.send_pending:
+        return send_pending(Api())
+    if args.last_spoke:
+        api = Api(); me = api.call("GET", "/users/me"); contacts = load_contacts()
+        for r in recipients(args):
+            u = lookup(api, r, contacts)
+            print("  %-20s %s" % (u["username"], greet_status(api, me["id"], u)))
+        return 0
+    if not args.message_file:
+        ap.error("--message-file is required (or use --wait-reply POST_ID)")
+    if args.edit:
+        api = Api()
+        if args.dry_run:
+            print("would edit post %s" % args.edit); return
+        patch = {"message": read_message(args.message_file)}
+        if args.attach:
+            patch["file_ids"] = [api.upload(api.call("GET", "/posts/" + args.edit)["channel_id"], args.attach)]
+        post = api.call("PUT", "/posts/%s/patch" % args.edit, patch)
+        if args.attach and not post.get("file_ids"):
+            sys.exit("mm-dm: text replaced, but the server ignored the attachment on edit")
+        print("edited post %s" % args.edit); return
+    if args.channel:
+        return post_channel(Api(), args.channel, read_message(args.message_file), args.dry_run)
+
+    template = read_message(args.message_file)
+    api = Api()
+    me = api.call("GET", "/users/me")
+
+    contacts = load_contacts()
+    resolved, failed = [], []
+    for r in recipients(args):
+        try:
+            u = lookup(api, r, contacts)
+            resolved.append((r, u))
+        except RuntimeError as e:
+            failed.append((r, str(e)))
+
+    print("from: %s" % me["username"])
+    for r, u in resolved:
+        print("  ok   %-40s -> %s (%s %s)" % (r, u["username"], u.get("first_name", ""), u.get("last_name", "")))
+    for r, err in failed:
+        print("  FAIL %-40s %s" % (r, err))
+
+    if args.dry_run:
+        items = []
+        for r, u in resolved:
+            st = greet_status(api, me["id"], u)
+            msg = render(template, u, st)
+            items.append({"alias": r, "user": {k: u.get(k, "") for k in USER_KEYS}, "message": msg})
+            print("\n--- to %s: %s ---\n%s" % (u["username"], st, msg))
+        if not failed:
+            os.makedirs(os.path.dirname(PENDING), exist_ok=True)
+            with open(PENDING, "w") as f:
+                json.dump({"created": time.time(), "items": items}, f)
+            print("\n--- dry run: %d resolved, nothing sent; send exactly this with: mm-dm --send-pending ---" % len(resolved))
+        else:
+            # An older preview must not stay sendable after a failed one.
+            if os.path.exists(PENDING):
+                os.remove(PENDING)
+            print("\n--- dry run: %d resolved, %d failed, nothing sent ---" % (len(resolved), len(failed)))
+        return 0
+    if failed:
+        print("mm-dm: %d recipient(s) did not resolve; nothing sent. Fix or remove them and re-run." % len(failed))
+        return 1
+
+    sent = 0
+    for r, u in resolved:
+        msg = render(template, u, greet_status(api, me["id"], u))
+        try:
+            ch = api.call("POST", "/channels/direct", [me["id"], u["id"]])
+            post = api.call("POST", "/posts", {"channel_id": ch["id"], "message": msg})
+            print("  sent %-20s post %s" % (u["username"], post["id"]))
+            sent += 1
+            remember(contacts, r, u)
+        except RuntimeError as e:
+            print("  FAIL %-20s %s" % (u["username"], e))
+    print("--- sent %d of %d ---" % (sent, len(resolved)))
+    return 0 if sent == len(resolved) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

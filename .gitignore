@@ -1,0 +1,7 @@
+# Personal data: never commit these.
+voice.md
+contacts.json
+contacts.json.tmp
+# Local leftovers.
+*.bak
+__pycache__/
