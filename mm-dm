@@ -35,6 +35,7 @@ mm-dm --wait-reply POST_ID [--interval 60] [--timeout-hours 24]
 """
 import argparse
 import json
+import re
 import os
 import sys
 import time
@@ -271,10 +272,12 @@ def send_pending(api):
 
 def post_channel(api, target, msg, dry_run):
     team, _, name = target.partition("/")
-    if not name:
-        sys.exit("mm-dm: --channel takes TEAM/CHANNEL, as in the channel URL")
+    if not name and not re.fullmatch(r"[a-z0-9]{26}", target):
+        sys.exit("mm-dm: --channel takes TEAM/CHANNEL, as in the channel URL, or a 26-char channel id")
     try:
-        ch = api.call("GET", "/teams/name/%s/channels/name/%s" % (team, name))
+        # a bare id covers group messages, which have no TEAM/CHANNEL URL
+        ch = api.call("GET", "/channels/%s" % target) if not name else \
+            api.call("GET", "/teams/name/%s/channels/name/%s" % (team, name))
     except RuntimeError as e:
         sys.exit("mm-dm: channel %s not found or not visible: %s" % (target, e))
     print("from: %s\n  ok   channel %s (%s)" % (api.call("GET", "/users/me")["username"], target, ch.get("display_name", "")))

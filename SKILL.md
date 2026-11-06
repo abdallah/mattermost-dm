@@ -52,7 +52,7 @@ If the user already approved the exact text and says "send it", preview and send
 
 ## Posting to a channel
 
-`--channel TEAM/CHANNEL` posts once to a channel instead of DMs. TEAM and CHANNEL are the names in
+`--channel TEAM/CHANNEL` (or a bare 26-char channel id, for group messages) posts once to a channel instead of DMs. TEAM and CHANNEL are the names in
 the channel URL (for example `my-team/town-square`). Run it with `--dry-run` first: the output names
 the channel it resolved. It prints `sent TEAM/CHANNEL post <id>`.
 
